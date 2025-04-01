@@ -19,7 +19,7 @@ import (
 )
 
 // UserAgent is the user agent string used for HTTP requests
-const UserAgent = "GGUF-Downloader/1.0 (github.com/yourusername/ggufDownloader)"
+const UserAgent = "GGUF-Downloader/1.0 (github.com/emreugur35/ggufDownloader)"
 
 type Manifest struct {
 	Layers []Layer `json:"layers"`
