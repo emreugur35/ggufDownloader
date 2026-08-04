@@ -1,17 +1,19 @@
 # GGUF Downloader
 
-A Go utility for downloading GGUF model files from the Ollama registry.
+A Go utility for downloading GGUF model files directly from the Ollama registry.
 
 ## Overview
 
-GGUF Downloader is a simple command-line tool that allows you to:
-- List available models from the Ollama registry in a tabular format
-- Download specific model versions in GGUF format
+GGUF Downloader is a lightweight command-line tool that allows you to:
+- Search and list available models from the Ollama registry in a tabular format
+- Download GGUF model files directly from the official Ollama registry
+- Support `model:tag` shorthand syntax (e.g., `-model llama3:8b`)
+- Save downloaded GGUF files with clean, cross-platform filenames
 
 ## Installation
 
 ### Prerequisites
-- Go 1.16 or later
+- Go 1.18 or later
 
 ### Building from source
 ```bash
@@ -22,77 +24,64 @@ go build
 
 ## Usage
 
-### List all available models
+### List popular models
 ```bash
 ./ggufDownloader
 ```
 
-This will display a table of the most popular models with their available sizes:
+This will display a table of the top popular models with their available sizes and parameter options:
 
 ```
 === Available models from Ollama ===
 
 MODEL                AVAILABLE SIZES                  
 --------------------------------------------------
-llama2               7b, 13b, 70b                     
-phi                  3b, mini                         
-mistral              7b, 7b-instruct, 7b-instruct-v0.2
-dolphin-phi          2.7b                             
-neural-chat          7b                               
-vicuna               7b, 13b, 33b                     
-llama3               8b, 70b                          
-codellama            7b, 13b, 34b                     
-orca-mini            3b, 7b, 13b                      
-gemma                2b, 7b                           
-
-... and more (use -list to see all)
+glm-5.2              latest                           
+kimi-k3              latest                           
+laguna-s-2.1          latest                           
+gemma4               e2b, e4b, 12b, 26b, 31b          
+qwen3.5              0.8b, 2b, 4b, 9b, 27b, 35b, 122b 
+...
 ```
 
-### List all models with details
+### Search models
+```bash
+./ggufDownloader -search llama
+```
+
+### Detailed listing
 ```bash
 ./ggufDownloader -list
 ```
 
-This will display an extended table with capabilities, download counts, and update dates:
-
-```
-=== Available models from Ollama ===
-
-MODEL                AVAILABLE SIZES                  CAPABILITIES                      DOWNLOADS            UPDATED
------------------------------------------------------------------------------------------------------------------
-llama2               7b, 13b, 70b                     chat, vision                      1.2M                 3 weeks ago
-phi                  3b, mini                         code, math                        856K                 1 month ago
-mistral              7b, 7b-instruct, 7b-instruct-v0.2 chat, reasoning                   742K                 2 weeks ago
-...
-```
-
 ### Download a specific model
-```bash
-./ggufDownloader -model llama2 -params 7b
-```
 
-This will download the specified model and save it as `llama2:7b.gguf` in the current directory.
+You can specify the model and tag/params in several ways:
+
+```bash
+# Using model:tag syntax:
+./ggufDownloader -model llama3:8b
+
+# Using separate flags:
+./ggufDownloader -model llama2 -params 7b
+
+# Defaulting to latest tag:
+./ggufDownloader -model phi3
+
+# Custom output filename:
+./ggufDownloader -model mistral -params 7b-instruct -out custom_mistral.gguf
+```
 
 ## Command-line Options
 
 | Option    | Description                                          | Example                         |
 |-----------|------------------------------------------------------|---------------------------------|
-| `-model`  | The name of the model to download                    | `-model llama2`                 |
-| `-params` | The parameters/size of the model to download         | `-params 7b`                    |
-| `-list`   | Show detailed list of all available models           | `-list`                         |
+| `-model`  | The name of the model to download (or `model:tag`)   | `-model llama3:8b`              |
+| `-params` | The parameters/tag of the model to download          | `-params 7b`                    |
+| `-out`    | Custom output filename for the downloaded GGUF file  | `-out my_model.gguf`            |
+| `-search` | Search query for model names                         | `-search llama`                 |
+| `-list`   | Show detailed list of available models               | `-list`                         |
 | `-help`   | Display help information                             | `-help`                         |
-
-## Examples
-
-### Quick model download
-```bash
-./ggufDownloader -model phi -params latest
-```
-
-### Download a specific model version
-```bash
-./ggufDownloader -model mistral -params 7b-instruct
-```
 
 ## License
 

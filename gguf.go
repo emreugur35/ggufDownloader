@@ -28,6 +28,7 @@ type Manifest struct {
 type Layer struct {
 	MediaType string `json:"mediaType"`
 	Digest    string `json:"digest"`
+	Size      int64  `json:"size"`
 }
 
 // ModelInfo represents information about an available model
@@ -42,34 +43,57 @@ type ModelInfo struct {
 }
 
 func fetchManifest(modelName, modelParameters string) (*Manifest, error) {
-	url := fmt.Sprintf("https://registry.ollama.ai/v2/library/%s/manifests/%s", modelName, modelParameters)
-	resp, err := http.Get(url)
+	registryPath := modelName
+	if !strings.Contains(registryPath, "/") {
+		registryPath = "library/" + registryPath
+	}
+
+	url := fmt.Sprintf("https://registry.ollama.ai/v2/%s/manifests/%s", registryPath, modelParameters)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.ollama.image.manifest.v1+json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("model or tag not found: %s:%s (HTTP 404)", modelName, modelParameters)
+	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, errors.New("failed to fetch manifest: " + resp.Status)
+		return nil, fmt.Errorf("failed to fetch manifest: %s", resp.Status)
 	}
 
 	var manifest Manifest
 	if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
-		return nil, errors.New("invalid JSON response")
+		return nil, errors.New("invalid manifest JSON response")
 	}
 
 	return &manifest, nil
 }
 
 func downloadFile(url, filename string) error {
-	resp, err := http.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", UserAgent)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return errors.New("failed to download file: " + resp.Status)
+		return fmt.Errorf("failed to download file: %s", resp.Status)
 	}
 
 	totalSize := resp.ContentLength
@@ -81,11 +105,35 @@ func downloadFile(url, filename string) error {
 
 	bar := progressbar.DefaultBytes(totalSize, "Downloading")
 	_, err = io.Copy(io.MultiWriter(file, bar), resp.Body)
-	return err
+	if err != nil {
+		_ = os.Remove(filename)
+		return err
+	}
+	return nil
 }
 
-func fetchAvailableModels() ([]ModelInfo, error) {
-	req, err := http.NewRequest("GET", "https://ollama.com/search?o=popular&c=all&q=", nil)
+func isParameterSize(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return false
+	}
+	if strings.HasSuffix(s, "b") || strings.HasSuffix(s, "m") {
+		numPart := strings.TrimSuffix(strings.TrimSuffix(s, "b"), "m")
+		numPart = strings.TrimPrefix(numPart, "e")
+		var f float64
+		if _, err := fmt.Sscanf(numPart, "%f", &f); err == nil {
+			return true
+		}
+	}
+	sizes := map[string]bool{
+		"mini": true, "small": true, "medium": true, "large": true, "full": true, "tiny": true,
+	}
+	return sizes[s]
+}
+
+func fetchAvailableModels(searchQuery string) ([]ModelInfo, error) {
+	url := "https://ollama.com/search?o=popular&c=all&q=" + strings.TrimSpace(searchQuery)
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -108,94 +156,124 @@ func fetchAvailableModels() ([]ModelInfo, error) {
 	}
 
 	var models []ModelInfo
-	doc.Find("li[x-test-model]").Each(func(i int, li *goquery.Selection) {
-		model := ModelInfo{}
+	seen := make(map[string]bool)
 
-		// Extract model name
-		titleSpan := li.Find("span[x-test-search-response-title]")
-		model.Name = strings.TrimSpace(titleSpan.Text())
+	doc.Find("a[href^=\"/library/\"]").Each(func(i int, a *goquery.Selection) {
+		href, exists := a.Attr("href")
+		if !exists {
+			return
+		}
+
+		rawName := strings.TrimPrefix(href, "/library/")
+		nameParts := strings.Split(rawName, ":")
+		modelName := strings.TrimSpace(nameParts[0])
+
+		if modelName == "" || seen[modelName] {
+			return
+		}
+		seen[modelName] = true
+
+		model := ModelInfo{
+			Name: modelName,
+		}
 
 		// Extract description
-		descPara := li.Find("p.max-w-lg.break-words.text-neutral-800")
-		model.Description = strings.TrimSpace(descPara.Text())
+		if descP := a.Find("p.max-w-lg").First(); descP.Length() > 0 {
+			model.Description = strings.TrimSpace(descP.Text())
+		} else if descP := a.Find("p").First(); descP.Length() > 0 {
+			model.Description = strings.TrimSpace(descP.Text())
+		}
 
-		// Extract parameter options (sizes)
-		li.Find("span[x-test-size]").Each(func(_ int, param *goquery.Selection) {
-			paramText := strings.TrimSpace(param.Text())
-			if paramText != "" {
-				model.Parameters = append(model.Parameters, paramText)
+		// Extract parameter sizes and capabilities from badges
+		a.Find("span.inline-flex").Each(func(_ int, badge *goquery.Selection) {
+			text := strings.TrimSpace(badge.Text())
+			if text == "" {
+				return
 			}
-		})
-
-		// Extract capabilities
-		li.Find("span[x-test-capability]").Each(func(_ int, cap *goquery.Selection) {
-			capText := strings.TrimSpace(cap.Text())
-			if capText != "" {
-				model.Capabilities = append(model.Capabilities, capText)
+			if isParameterSize(text) {
+				model.Parameters = append(model.Parameters, text)
+			} else {
+				model.Capabilities = append(model.Capabilities, text)
 			}
 		})
 
 		// Extract metadata
-		pullCountSpan := li.Find("span[x-test-pull-count]")
-		model.PullCount = strings.TrimSpace(pullCountSpan.Text())
+		var metaTexts []string
+		a.Find("span.flex.items-center").Each(func(_ int, meta *goquery.Selection) {
+			t := strings.Join(strings.Fields(strings.TrimSpace(meta.Text())), " ")
+			if t != "" {
+				metaTexts = append(metaTexts, t)
+			}
+		})
 
-		tagCountSpan := li.Find("span[x-test-tag-count]")
-		model.TagCount = strings.TrimSpace(tagCountSpan.Text())
-
-		updatedAtSpan := li.Find("span[x-test-updated]")
-		model.UpdatedAt = strings.TrimSpace(updatedAtSpan.Text())
-
-		if model.Name != "" {
-			models = append(models, model)
+		if len(metaTexts) > 0 {
+			model.PullCount = metaTexts[0]
 		}
+		if len(metaTexts) > 1 {
+			model.TagCount = metaTexts[1]
+		}
+		if len(metaTexts) > 2 {
+			model.UpdatedAt = metaTexts[2]
+		}
+
+		models = append(models, model)
 	})
 
 	return models, nil
 }
 
+func sanitizeFilename(name string) string {
+	r := strings.NewReplacer(
+		":", "-",
+		"/", "-",
+		"\\", "-",
+		" ", "_",
+	)
+	return r.Replace(name)
+}
+
 func displayUsageExamples() {
 	fmt.Println(color.CyanString("\nCommand-line Usage Examples:"))
-	fmt.Println(color.WhiteString("  # List all available models:"))
+	fmt.Println(color.WhiteString("  # List available models:"))
 	fmt.Println("  ./ggufDownloader")
 	fmt.Println("  ./ggufDownloader -list")
+	fmt.Println("  ./ggufDownloader -search llama")
 
 	fmt.Println(color.WhiteString("\n  # Download a specific model:"))
 	fmt.Println("  ./ggufDownloader -model llama2 -params 7b")
-	fmt.Println("  ./ggufDownloader -model phi -params latest")
-	fmt.Println("  ./ggufDownloader -model mistral -params 7b-instruct")
+	fmt.Println("  ./ggufDownloader -model llama3:8b")
+	fmt.Println("  ./ggufDownloader -model phi3")
+	fmt.Println("  ./ggufDownloader -model mistral -params 7b-instruct -out my_mistral.gguf")
 
-	fmt.Println(color.WhiteString("\n  # The downloaded file will be saved as:"))
-	fmt.Println("  # modelname:params.gguf (e.g., llama2:7b.gguf)")
+	fmt.Println(color.WhiteString("\n  # Output format:"))
+	fmt.Println("  # Files are saved as: modelname-params.gguf (e.g., llama2-7b.gguf)")
 }
 
 func displaySimpleUsage() {
 	fmt.Println(color.CyanString("\nSimple Usage:"))
 	fmt.Println(color.WhiteString("  List models:  ./ggufDownloader -list"))
-	fmt.Println(color.WhiteString("  Download:     ./ggufDownloader -model MODEL -params PARAMS"))
+	fmt.Println(color.WhiteString("  Search:       ./ggufDownloader -search QUERY"))
+	fmt.Println(color.WhiteString("  Download:     ./ggufDownloader -model MODEL [-params PARAMS] [-out FILENAME]"))
 	fmt.Println(color.WhiteString("  Help:         ./ggufDownloader -help"))
 
-	// Add some basic examples to the simple usage display
 	fmt.Println(color.YellowString("\nQuick Examples:"))
-	fmt.Println("  ./ggufDownloader -model llama2 -params 7b")
-	fmt.Println("  ./ggufDownloader -model phi -params latest")
+	fmt.Println("  ./ggufDownloader -model llama3:8b")
+	fmt.Println("  ./ggufDownloader -model phi3 -params latest")
 }
 
 // printModelsTable prints the models in a table format
 func printModelsTable(models []ModelInfo, showDetails bool) {
-	// Define column headers and widths
 	nameWidth := 20
 	sizesWidth := 30
 	capabilitiesWidth := 30
 	infoWidth := 20
 
-	// Find the max width needed for model names
 	for _, model := range models {
 		if len(model.Name) > nameWidth-3 {
 			nameWidth = len(model.Name) + 3
 		}
 	}
 
-	// Print table header
 	fmt.Println()
 	headerFmt := color.CyanString
 	fmt.Printf(headerFmt("%-*s", nameWidth, "MODEL"))
@@ -208,76 +286,81 @@ func printModelsTable(models []ModelInfo, showDetails bool) {
 	}
 	fmt.Println()
 
-	// Print separator line
 	separator := strings.Repeat("-", nameWidth+sizesWidth)
 	if showDetails {
 		separator += strings.Repeat("-", capabilitiesWidth+infoWidth+20)
 	}
 	fmt.Println(headerFmt(separator))
 
-	// Print each model
 	for _, model := range models {
-		// Model name in green
 		fmt.Printf(color.GreenString("%-*s", nameWidth, model.Name))
 
-		// Sizes in yellow
 		sizes := strings.Join(model.Parameters, ", ")
+		if sizes == "" {
+			sizes = "latest"
+		}
 		if len(sizes) > sizesWidth-3 {
 			sizes = sizes[:sizesWidth-6] + "..."
 		}
 		fmt.Printf(color.YellowString("%-*s", sizesWidth, sizes))
 
-		// Additional details
 		if showDetails {
-			// Capabilities
 			caps := strings.Join(model.Capabilities, ", ")
+			if caps == "" {
+				caps = "-"
+			}
 			if len(caps) > capabilitiesWidth-3 {
 				caps = caps[:capabilitiesWidth-6] + "..."
 			}
 			fmt.Printf(color.CyanString("%-*s", capabilitiesWidth, caps))
 
-			// Pull count
-			fmt.Printf(color.WhiteString("%-*s", infoWidth, model.PullCount))
+			pullCount := model.PullCount
+			if pullCount == "" {
+				pullCount = "-"
+			}
+			fmt.Printf(color.WhiteString("%-*s", infoWidth, pullCount))
 
-			// Updated date
-			fmt.Printf(color.WhiteString("%s", model.UpdatedAt))
+			updated := model.UpdatedAt
+			if updated == "" {
+				updated = "-"
+			}
+			fmt.Printf(color.WhiteString("%s", updated))
 		}
 		fmt.Println()
 	}
 }
 
 func main() {
-	modelName := flag.String("model", "", "The name of the model to download (e.g., phi3)")
-	modelParameters := flag.String("params", "", "The model parameters to use (e.g., 3.8b)")
+	modelName := flag.String("model", "", "The name of the model to download (e.g., phi3 or llama3:8b)")
+	modelParameters := flag.String("params", "", "The model parameters to use (e.g., 8b or latest)")
+	outputFile := flag.String("out", "", "Output filename for the GGUF file (optional)")
+	searchQuery := flag.String("search", "", "Search query for filtering models")
 	listModels := flag.Bool("list", false, "List available models")
 	flag.Parse()
 
-	// If no flags provided, or only -list flag is used, show available models
-	noArgsProvided := len(os.Args) == 1 // Just the program name, no args
-	if noArgsProvided || *listModels {
-		models, err := fetchAvailableModels()
+	noArgsProvided := len(os.Args) == 1
+	if noArgsProvided || *listModels || *searchQuery != "" {
+		models, err := fetchAvailableModels(*searchQuery)
 		if err != nil {
 			fmt.Println(color.RedString("[ERROR] %s", err))
 			os.Exit(1)
 		}
 
-		// Show the header with a clear separator for better visibility
-		fmt.Println(color.CyanString("\n=== Available models from Ollama ==="))
-
-		// Limit the number of models shown in the simple view to avoid overwhelming
-		maxModelsToShow := 10
-		if noArgsProvided && len(models) > maxModelsToShow {
-			modelsToShow := models
-			if len(models) > maxModelsToShow {
-				modelsToShow = models[:maxModelsToShow]
-			}
-			printModelsTable(modelsToShow, false)
-			fmt.Printf(color.WhiteString("\n... and %d more (use -list to see all)\n"), len(models)-maxModelsToShow)
-		} else {
-			printModelsTable(models, *listModels) // Show full details when -list is explicitly used
+		if len(models) == 0 {
+			fmt.Println(color.YellowString("\nNo models found matching your query."))
+			return
 		}
 
-		// Always show usage information, with varying detail based on context
+		fmt.Println(color.CyanString("\n=== Available models from Ollama ==="))
+
+		maxModelsToShow := 10
+		if noArgsProvided && len(models) > maxModelsToShow {
+			printModelsTable(models[:maxModelsToShow], false)
+			fmt.Printf(color.WhiteString("\n... and %d more (use -list to see all)\n"), len(models)-maxModelsToShow)
+		} else {
+			printModelsTable(models, *listModels || *searchQuery != "")
+		}
+
 		if noArgsProvided {
 			displaySimpleUsage()
 		} else {
@@ -286,26 +369,49 @@ func main() {
 		return
 	}
 
-	// Only check for required parameters if we're trying to download a model
-	if *modelName == "" || *modelParameters == "" {
+	rawModel := strings.TrimSpace(*modelName)
+	params := strings.TrimSpace(*modelParameters)
+
+	if rawModel == "" {
 		displayUsageExamples()
-		fmt.Println(color.RedString("[ERROR] Model name and parameters are required."))
+		fmt.Println(color.RedString("[ERROR] Model name is required (-model)."))
 		fmt.Println(color.CyanString("\nRun without arguments to see available models."))
 		os.Exit(1)
 	}
 
-	manifest, err := fetchManifest(*modelName, *modelParameters)
+	if strings.Contains(rawModel, ":") {
+		parts := strings.SplitN(rawModel, ":", 2)
+		rawModel = parts[0]
+		if params == "" {
+			params = parts[1]
+		}
+	}
+
+	if params == "" {
+		params = "latest"
+	}
+
+	manifest, err := fetchManifest(rawModel, params)
 	if err != nil {
 		fmt.Println(color.RedString("[ERROR] %s", err))
 		os.Exit(1)
 	}
 
 	var modelDigest string
+	var maxLayerSize int64
 	for _, layer := range manifest.Layers {
 		if layer.MediaType == "application/vnd.ollama.image.model" {
 			modelDigest = layer.Digest
 			break
 		}
+		if layer.Size > maxLayerSize {
+			maxLayerSize = layer.Size
+			modelDigest = layer.Digest
+		}
+	}
+
+	if modelDigest == "" && len(manifest.Layers) > 0 {
+		modelDigest = manifest.Layers[0].Digest
 	}
 
 	if modelDigest == "" {
@@ -313,10 +419,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	downloadURL := fmt.Sprintf("https://registry.ollama.ai/v2/library/%s/blobs/%s", *modelName, modelDigest)
-	outputFilename := fmt.Sprintf("%s:%s.gguf", *modelName, *modelParameters)
+	registryPath := rawModel
+	if !strings.Contains(registryPath, "/") {
+		registryPath = "library/" + registryPath
+	}
 
-	fmt.Println(color.CyanString("[INFO] Downloading %s...", outputFilename))
+	downloadURL := fmt.Sprintf("https://registry.ollama.ai/v2/%s/blobs/%s", registryPath, modelDigest)
+
+	outputFilename := strings.TrimSpace(*outputFile)
+	if outputFilename == "" {
+		outputFilename = fmt.Sprintf("%s-%s.gguf", sanitizeFilename(rawModel), sanitizeFilename(params))
+	}
+
+	fmt.Println(color.CyanString("[INFO] Downloading %s (model: %s, tag: %s)...", outputFilename, rawModel, params))
 	if err := downloadFile(downloadURL, outputFilename); err != nil {
 		fmt.Println(color.RedString("[ERROR] %s", err))
 		os.Exit(1)
